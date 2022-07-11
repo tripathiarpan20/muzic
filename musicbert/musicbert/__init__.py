@@ -11,8 +11,11 @@ from fairseq.data import (MaskTokensDataset,
                           LanguagePairDataset,
                           PrependTokenDataset,
                           data_utils)
+                          
 from fairseq.models import register_model, register_model_architecture
-from fairseq.models.roberta import TransformerSentenceEncoder, RobertaEncoder, RobertaModel
+from fairseq.models.roberta import RobertaEncoder, RobertaModel
+from fairseq.models.transformer import TransformerEncoder
+from fairseq.modules.transformer_sentence_encoder import init_bert_params
 from fairseq.tasks import register_task
 from fairseq.tasks.sentence_prediction import SentencePredictionTask
 import torch.nn as nn
@@ -215,26 +218,35 @@ class OctupleMaskTokensDataset(MaskTokensDataset):
             masked_item[set_mask] = self.mask_idx
             return torch.from_numpy(masked_item)
 
-
-class OctupleEncoder(TransformerSentenceEncoder):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+#With reference from https://github.com/facebookresearch/fairseq/blob/main/fairseq/models/transformer/transformer_encoder.py
+class OctupleEncoder(TransformerEncoder):
+    def __init__(self, cfg, dictionary, embed_tokens):
+        super().__init__(cfg, dictionary, embed_tokens)
         self.tpu = False
-        embedding_dim = kwargs['embedding_dim']
+        embedding_dim = embed_tokens.embedding_dim
         if not disable_cp:
             self.downsampling = nn.Sequential(
                 nn.Linear(embedding_dim * 8, embedding_dim))
             self.upsampling = nn.Sequential(
                 nn.Linear(embedding_dim, embedding_dim * 8))
 
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        segment_labels: torch.Tensor = None,
-        last_state_only: bool = False,
-        positions: Optional[torch.Tensor] = None,
-        token_embeddings: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_embedding(
+        self, tokens, segment_labels , last_state_only, 
+        positions ,token_embeddings: Optional[torch.Tensor] = None
+    ):
+        # embed tokens and positions
+        # if token_embedding is None:
+        #     token_embedding = self.embed_tokens(src_tokens)
+        # x = embed = self.embed_scale * token_embedding
+        # if self.embed_positions is not None:
+        #     x = embed + self.embed_positions(src_tokens)
+        # if self.layernorm_embedding is not None:
+        #     x = self.layernorm_embedding(x)
+        # x = self.dropout_module(x)
+        # if self.quant_noise is not None:
+        #     x = self.quant_noise(x)
+        # return x, embed
+
         ratio = 1 if disable_cp else 8
         if not disable_cp:
             assert tokens.shape[1] % ratio == 0, 'token sequences length should be multiple of ' + str(
@@ -252,8 +264,8 @@ class OctupleEncoder(TransformerSentenceEncoder):
             x = self.embed_tokens(tokens)
         if not disable_cp:
             x = self.downsampling(x.view(x.shape[0], x.shape[1] // ratio, -1))
-        if self.embed_scale is not None:
-            x = x * self.embed_scale
+        #self.embed_scale seems to have default value of 1 in fairseq v0.12.2:
+        x = embed = self.embed_scale * token_embeddings
         if self.embed_positions is not None:
             x = x + \
                 self.embed_positions(tokens[:, ::ratio], positions=positions)
@@ -261,54 +273,226 @@ class OctupleEncoder(TransformerSentenceEncoder):
             x = x + self.segment_embeddings(segment_labels)
         if self.quant_noise is not None:
             x = self.quant_noise(x)
-        if self.emb_layer_norm is not None:
-            x = self.emb_layer_norm(x)
+        if self.layernorm_embedding is not None:
+            x = self.layernorm_embedding(x)
         x = self.dropout_module(x)
         if padding_mask is not None:
             x = x * (1 - padding_mask.unsqueeze(-1).type_as(x))
+        return x, embed, padding_mask
+
+
+    def forward(
+        self,
+        src_tokens,
+        src_lengths: Optional[torch.Tensor] = None,
+        last_state_only: bool = False,
+        token_embeddings: Optional[torch.Tensor] = None,
+        segment_labels: torch.Tensor = None,
+        positions: Optional[torch.Tensor] = None
+    ):
+        
+        return self.forward_scriptable(
+            src_tokens, src_lengths, last_state_only, token_embeddings,
+            segment_labels , positions
+        )
+
+    def forward_scriptable(
+        self,
+        src_tokens: torch.Tensor,
+        src_lengths: Optional[torch.Tensor] = None,
+        last_state_only: bool = False,
+        token_embeddings: Optional[torch.Tensor] = None,
+        segment_labels: torch.Tensor = None,
+        positions: Optional[torch.Tensor] = None,
+    ):
+        ratio = 1 if disable_cp else 8
+
+        x, encoder_embedding, encoder_padding_mask = self.forward_embedding(src_tokens, segment_labels,
+        last_state_only, positions ,token_embeddings)
+
         x = x.transpose(0, 1)
-        inner_states = []
-        if not last_state_only:
-            inner_states.append(x)
+
+        # inner_states = []
+        # if not last_state_only:
+        #     inner_states.append(x)
+        # for layer in self.layers:
+        #     x, _ = layer(x, self_attn_padding_mask=padding_mask)
+        #     if not last_state_only:
+        #         inner_states.append(x)
+        # if not disable_cp:
+        #     x = x.transpose(0, 1)
+        #     x = self.upsampling(x).view(x.shape[0], x.shape[1] * ratio, -1)
+        #     x = x.transpose(0, 1)
+        # sentence_rep = x[0, :, :]
+        # if last_state_only:
+        #     inner_states = [x]
+        # if self.traceable:
+        #     return torch.stack(inner_states), sentence_rep
+        # else:
+        #     return inner_states, sentence_rep
+
+        encoder_states = []
+        fc_results = []
+        
+        return_all_hiddens = not last_state_only
+
+        if return_all_hiddens:
+            encoder_states.append(x)
+
+        # nested tensor and BT enable
+        layer = self.layers[0]
+        BT_flag = False
+        NT_flag = False
+
+        BT_version = False
+        NT_version = False
+        if "fb" in torch.__version__:
+            BT_version = True
+            NT_version = True
+        else:
+            if "+" in torch.__version__:
+                torch_version = torch.__version__.split("+")[0]
+            else:
+                torch_version = torch.__version__
+
+            torch_version = torch_version.split(".")
+            int_version = (
+                int(torch_version[0]) * 1000
+                + int(torch_version[1]) * 10
+                + int(torch_version[2])
+            )
+            if len(torch_version) == 3:
+                if int_version >= 1120:
+                    BT_version = True
+                if int_version >= 1131:
+                    NT_version = True
+            elif len(torch_version) == 4:
+                if int_version >= 1130:
+                    BT_version = True
+
+                if int_version >= 1131 or (
+                    int_version == 1130 and torch_version[3][3:] >= "20220613"
+                ):
+                    NT_version = True
+
+        if (
+            BT_version
+            and x.dim() == 3
+            and layer.load_to_BT
+            and not layer.return_fc
+            and layer.can_use_fastpath
+            and not layer.training
+            and not layer.ever_training
+            and not layer.cfg_checkpoint_activations
+        ):
+
+            x = x.transpose(0, 1)
+
+            if NT_version:
+                if (
+                    encoder_padding_mask is not None
+                    and torch._nested_tensor_from_mask_left_aligned(
+                        x, encoder_padding_mask.logical_not()
+                    )
+                ):
+                    if not torch.is_grad_enabled() or not x.requires_grad:
+                        x = torch._nested_tensor_from_mask(
+                            x, encoder_padding_mask.logical_not()
+                        )
+                        NT_flag = True
+            BT_flag = True
+
+        # encoder layers
+        if NT_flag:
+            processing_mask = None
+        else:
+            processing_mask = encoder_padding_mask
+
+        if encoder_padding_mask is not None:
+            has_pads = True 
+        else:
+            has_pads = False
+        
+        encoder_padding_mask_out = processing_mask if has_pads else None
         for layer in self.layers:
-            x, _ = layer(x, self_attn_padding_mask=padding_mask)
-            if not last_state_only:
-                inner_states.append(x)
+            lr = layer(x, encoder_padding_mask=encoder_padding_mask_out)
+
+            if isinstance(lr, tuple) and len(lr) == 2:
+                x, fc_result = lr
+            else:
+                x = lr
+                fc_result = None
+
+            if return_all_hiddens and not torch.jit.is_scripting():
+                assert encoder_states is not None
+                encoder_states.append(x)
+                fc_results.append(fc_result)
+
+        #Upsampling octuples back to initial shape after forwarding through encoder layers
         if not disable_cp:
             x = x.transpose(0, 1)
             x = self.upsampling(x).view(x.shape[0], x.shape[1] * ratio, -1)
             x = x.transpose(0, 1)
-        sentence_rep = x[0, :, :]
-        if last_state_only:
-            inner_states = [x]
-        if self.traceable:
-            return torch.stack(inner_states), sentence_rep
-        else:
-            return inner_states, sentence_rep
+
+
+        if NT_flag:
+            x = x.to_padded_tensor(0.0)
+
+        if NT_flag or BT_flag:
+            x = x.transpose(0, 1)
+
+        # IMPORTANT!!: Layernorm at this step was not present in original OctupleEncoder script w/ fairseq v0.10.1, hence commenting it out from `TransformerEncoder` code
+        # See usage of `cfg.layernorm_embedding` and `cfg.encoder.normalize_before` in https://github.com/facebookresearch/fairseq/blob/main/fairseq/models/transformer/transformer_encoder.py#L77
+        
+        # if self.layer_norm is not None:
+        #     x = self.layer_norm(x)
+
+
+        src_lengths = (
+            src_tokens.ne(self.padding_idx)
+            .sum(dim=1, dtype=torch.int32)
+            .reshape(-1, 1)
+            .contiguous()
+        )
+        return {
+            "encoder_out": [x],  # T x B x C
+            "encoder_padding_mask": [encoder_padding_mask],  # B x T
+            "encoder_embedding": [encoder_embedding],  # B x T x C
+            "encoder_states": encoder_states,  # List[T x B x C]
+            "fc_results": fc_results,  # List[T x B x C]
+            "src_tokens": [],
+            "src_lengths": [src_lengths],
+        }
+
 
 
 class MusicBERTEncoder(RobertaEncoder):
     def __init__(self, args, dictionary):
         super().__init__(args, dictionary)
-        self.sentence_encoder = OctupleEncoder(
-            padding_idx=dictionary.pad(),
-            vocab_size=len(dictionary),
-            num_encoder_layers=args.encoder_layers,
-            embedding_dim=args.encoder_embed_dim,
-            ffn_embedding_dim=args.encoder_ffn_embed_dim,
-            num_attention_heads=args.encoder_attention_heads,
-            dropout=args.dropout,
-            attention_dropout=args.attention_dropout,
-            activation_dropout=args.activation_dropout,
-            layerdrop=args.encoder_layerdrop,
-            max_seq_len=args.max_positions,
-            num_segments=0,
-            encoder_normalize_before=True,
-            apply_bert_init=True,
-            activation_fn=args.activation_fn,
-            q_noise=args.quant_noise_pq,
-            qn_block_size=args.quant_noise_pq_block_size,
+        self.embed_tokens = self.build_embedding(
+            len(dictionary), args.encoder_embed_dim, dictionary.pad()
         )
+
+        self.sentence_encoder = self.build_encoder(args, dictionary, self.embed_tokens)
+
+        self.lm_head = self.build_lm_head(
+            embed_dim=args.encoder_embed_dim,
+            output_dim=len(dictionary),
+            activation_fn=args.activation_fn,
+            weight=(
+                self.sentence_encoder.embed_tokens.weight
+                if not args.untie_weights_roberta
+                else None
+            ),
+        )
+
+    def build_embedding(self, vocab_size, embedding_dim, padding_idx):
+        return nn.Embedding(vocab_size, embedding_dim, padding_idx)
+
+    def build_encoder(self, args, dictionary, embed_tokens):
+        encoder = OctupleEncoder(args, dictionary, embed_tokens)
+        encoder.apply(init_bert_params)
+        return encoder
 
 
 @register_model("musicbert")
